@@ -1,0 +1,45 @@
+{
+    "name": "server",
+    "version": "0.0.1",
+    "description": "Express.js + Typescript + MongoDB",
+    "main": "dist/server.js",
+    "scripts": {
+        "start": "tsc && node dist/server.js",
+        "dev": "ts-node-dev server.ts",
+        "build": "tsc",
+        "test": "jest --runInBand",
+        "lint": "eslint . --ext .ts",
+        "lint:fix": "eslint . --ext .ts --fix",
+        "format": "prettier --write \"**/(*.json|*.ts|*.js)\"",
+        "pm2": "pm2 start dist/server.js --name server --watch"
+    },
+    "author": "oynozan",
+    "license": "MIT",
+    "dependencies": {
+        "axios": "^1.8.1",
+        "cookie-parser": "^1.4.7",
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.7",
+        "ethers": "^6.15.0",
+        "express": "^4.21.2",
+        "express-rate-limit": "^8.0.1",
+        "helmet": "^8.1.0",
+        "jsonwebtoken": "^9.0.2",
+        "mongoose": "^8.18.3",
+        "socket.io": "^4.8.1",
+        "socket.io-client": "^4.8.1"
+    },
+    "devDependencies": {
+        "@types/cookie": "^0.6.0",
+        "@types/cookie-parser": "^1.4.8",
+        "@types/cors": "^2.8.17",
+        "@types/express": "^5.0.0",
+        "@types/jest": "^30.0.0",
+        "@types/jsonwebtoken": "^9.0.9",
+        "@types/node": "^22.13.9",
+        "jest": "^30.2.0",
+        "prettier": "^3.5.3",
+        "ts-jest": "^29.4.6",
+        "ts-node-dev": "^2.0.0"
+    }
+}
