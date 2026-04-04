@@ -1,7 +1,9 @@
 import { Router } from "express";
 import Market from "../../../models/Markets";
+import SyncCursor from "../../../models/SyncCursor";
 
 const router = Router();
+const CURSOR_KEY = "market-sync";
 
 interface SyncToken {
     tokenId: string;
@@ -30,7 +32,18 @@ interface SyncPayload {
     syncedAt: number;
     marketCount: number;
     markets: SyncMarket[];
+    nextOffset?: number;
 }
+
+router.get("/cursor", async (_req, res) => {
+    try {
+        const cursor = await SyncCursor.findOne({ key: CURSOR_KEY }).lean();
+        res.json({ offset: cursor?.offset ?? 0 });
+    } catch (err) {
+        console.error("[market-sync] Error reading cursor:", err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
 
 router.post("/", async (req, res) => {
     try {
@@ -47,33 +60,42 @@ router.post("/", async (req, res) => {
             `[market-sync] Received ${payload.marketCount} markets (synced at ${syncedAt.toISOString()})`,
         );
 
-        const ops = payload.markets.map((m) => ({
-            updateOne: {
-                filter: { conditionId: m.conditionId },
-                update: {
-                    $set: {
-                        question: m.question,
-                        slug: m.slug,
-                        endDate: new Date(m.endDate),
-                        tokens: toTokensObject(m.tokens),
-                        syncedAt,
+        if (payload.markets.length > 0) {
+            const ops = payload.markets.map((m) => ({
+                updateOne: {
+                    filter: { conditionId: m.conditionId },
+                    update: {
+                        $set: {
+                            question: m.question,
+                            slug: m.slug,
+                            endDate: new Date(m.endDate),
+                            tokens: toTokensObject(m.tokens),
+                            syncedAt,
+                        },
                     },
+                    upsert: true,
                 },
-                upsert: true,
-            },
-        }));
+            }));
 
-        const result = await Market.bulkWrite(ops);
+            const result = await Market.bulkWrite(ops);
 
-        console.log(
-            `[market-sync] Upserted ${result.upsertedCount} new, modified ${result.modifiedCount} existing`,
-        );
+            console.log(
+                `[market-sync] Upserted ${result.upsertedCount} new, modified ${result.modifiedCount} existing`,
+            );
+        }
+
+        if (typeof payload.nextOffset === "number") {
+            await SyncCursor.findOneAndUpdate(
+                { key: CURSOR_KEY },
+                { $set: { offset: payload.nextOffset } },
+                { upsert: true },
+            );
+            console.log(`[market-sync] Cursor updated to offset=${payload.nextOffset}`);
+        }
 
         res.status(200).json({
             ok: true,
             received: payload.marketCount,
-            upserted: result.upsertedCount,
-            modified: result.modifiedCount,
         });
     } catch (err) {
         console.error("[market-sync] Error processing payload:", err);
