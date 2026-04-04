@@ -331,6 +331,7 @@ export async function placeMarketOrder(params: {
 const USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const SWAP_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+const CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
 export async function getPolymarketWalletBalance(): Promise<bigint> {
     const wallet = getWallet();
@@ -347,6 +348,22 @@ export async function getPolymarketWalletBalance(): Promise<bigint> {
     return bal;
 }
 
+export async function getConditionalTokenBalance(tokenId: string): Promise<number> {
+    const wallet = getWallet();
+    const rpc = process.env.POLYGON_RPC_URL;
+    if (!rpc) return 0;
+    const provider = new ethers.JsonRpcProvider(rpc);
+    const ctf = new ethers.Contract(
+        CTF_CONTRACT,
+        ["function balanceOf(address,uint256) view returns (uint256)"],
+        provider,
+    );
+    const bal: bigint = await ctf.balanceOf(wallet.address, tokenId);
+    const balNum = Number(bal) / 10 ** COLLATERAL_DECIMALS;
+    console.log(`[CLOB] getConditionalTokenBalance(${tokenId.slice(0, 12)}...) = ${bal} (${balNum})`);
+    return balNum;
+}
+
 /* ---------- Swap native USDC → USDC.e on polymarket wallet ---------- */
 
 function getPolymarketSigner(): ethers.Wallet {
@@ -356,13 +373,41 @@ function getPolymarketSigner(): ethers.Wallet {
     return getWallet().connect(provider);
 }
 
+export async function getNativeUsdcBalance(): Promise<bigint> {
+    const wallet = getWallet();
+    const rpc = process.env.POLYGON_RPC_URL;
+    if (!rpc) return 0n;
+    const provider = new ethers.JsonRpcProvider(rpc);
+    const usdc = new ethers.Contract(
+        NATIVE_USDC,
+        ["function balanceOf(address) view returns (uint256)"],
+        provider,
+    );
+    const bal: bigint = await usdc.balanceOf(wallet.address);
+    console.log(`[CLOB] getNativeUsdcBalance(${wallet.address}) = ${bal}`);
+    return bal;
+}
+
 /**
  * Swaps native USDC to USDC.e via Uniswap V3 using the Polymarket wallet.
  * Called after the Vault sends native USDC to this wallet.
  */
 export async function swapNativeUsdcToUsdcE(amountMicro: bigint): Promise<void> {
-    console.log(`[CLOB] swapNativeUsdcToUsdcE amount=${amountMicro}`);
+    console.log(`[CLOB] swapNativeUsdcToUsdcE requested=${amountMicro}`);
     const signer = getPolymarketSigner();
+
+    const nativeBalance = await getNativeUsdcBalance();
+    if (nativeBalance === 0n) {
+        throw new Error(
+            `[CLOB] Polymarket wallet has 0 native USDC — cannot swap. Expected ${amountMicro}. ` +
+            `fundPolymarketWallet may have failed or sent to a different address.`,
+        );
+    }
+
+    const swapAmount = nativeBalance < amountMicro ? nativeBalance : amountMicro;
+    if (swapAmount < amountMicro) {
+        console.warn(`[CLOB] Native USDC balance (${nativeBalance}) < requested (${amountMicro}), swapping available balance only`);
+    }
 
     const nativeUsdc = new ethers.Contract(
         NATIVE_USDC,
@@ -374,7 +419,7 @@ export async function swapNativeUsdcToUsdcE(amountMicro: bigint): Promise<void> 
     );
 
     const currentAllowance: bigint = await nativeUsdc.allowance(signer.address, SWAP_ROUTER);
-    if (currentAllowance < amountMicro) {
+    if (currentAllowance < swapAmount) {
         console.log("[CLOB] Approving SwapRouter for native USDC...");
         const approveTx = await nativeUsdc.approve(SWAP_ROUTER, ethers.MaxUint256);
         await approveTx.wait();
@@ -389,25 +434,26 @@ export async function swapNativeUsdcToUsdcE(amountMicro: bigint): Promise<void> 
         signer,
     );
 
-    console.log("[CLOB] Swapping native USDC → USDC.e on Uniswap V3...");
+    console.log(`[CLOB] Swapping ${swapAmount} native USDC → USDC.e on Uniswap V3...`);
     const tx = await router.exactInputSingle({
         tokenIn: NATIVE_USDC,
         tokenOut: USDC_E,
         fee: 100,
         recipient: signer.address,
         deadline: Math.floor(Date.now() / 1000) + 300,
-        amountIn: amountMicro,
-        amountOutMinimum: (amountMicro * 99n) / 100n,
+        amountIn: swapAmount,
+        amountOutMinimum: (swapAmount * 99n) / 100n,
         sqrtPriceLimitX96: 0n,
     });
     console.log(`[CLOB] Swap tx=${tx.hash}`);
     await tx.wait();
-    console.log(`[CLOB] Swap confirmed. ${amountMicro} native USDC → USDC.e`);
+    console.log(`[CLOB] Swap confirmed. ${swapAmount} native USDC → USDC.e`);
 }
 
 /* ---------- CTF Exchange approval ---------- */
 
 let _exchangeApproved = false;
+let _ctfApproved = false;
 
 /**
  * One-time max-approval of USDC.e for both CTF Exchange contracts.
@@ -442,6 +488,40 @@ export async function ensureExchangeApproval(): Promise<void> {
 
     _exchangeApproved = true;
     console.log("[CLOB] Exchange approvals OK");
+}
+
+/**
+ * One-time setApprovalForAll on the CTF contract so CTF Exchange
+ * contracts can transfer conditional tokens (needed for SELL orders).
+ */
+export async function ensureConditionalTokenApproval(): Promise<void> {
+    if (_ctfApproved) return;
+    console.log("[CLOB] Checking conditional token (ERC1155) approvals...");
+
+    const signer = getPolymarketSigner();
+    const ctf = new ethers.Contract(
+        CTF_CONTRACT,
+        [
+            "function isApprovedForAll(address,address) view returns (bool)",
+            "function setApprovalForAll(address,bool)",
+        ],
+        signer,
+    );
+
+    for (const exchange of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE]) {
+        const approved: boolean = await ctf.isApprovedForAll(signer.address, exchange);
+        if (!approved) {
+            console.log(`[CLOB] setApprovalForAll ${exchange} on CTF contract...`);
+            const tx = await ctf.setApprovalForAll(exchange, true);
+            await tx.wait();
+            console.log(`[CLOB] CTF approval granted to ${exchange}`);
+        } else {
+            console.log(`[CLOB] ${exchange} already approved for CTF tokens`);
+        }
+    }
+
+    _ctfApproved = true;
+    console.log("[CLOB] Conditional token approvals OK");
 }
 
 export function checkClobEnv(): void {

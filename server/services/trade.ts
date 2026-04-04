@@ -6,8 +6,11 @@ import {
     fetchMidpoint,
     fetchNegRisk,
     getPolymarketWalletBalance,
+    getConditionalTokenBalance,
+    getNativeUsdcBalance,
     swapNativeUsdcToUsdcE,
     ensureExchangeApproval,
+    ensureConditionalTokenApproval,
 } from "./polymarket-clob";
 import {
     getUserMargin,
@@ -192,6 +195,9 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
             console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet (native USDC)`);
             await fundPolymarketWallet(totalSettlement.toString());
 
+            const nativeBal = await getNativeUsdcBalance();
+            console.log(`[trade] Post-fund native USDC balance on poly wallet: ${nativeBal} (need ${totalSettlement})`);
+
             step++;
             console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e via Uniswap`);
             await swapNativeUsdcToUsdcE(totalSettlement);
@@ -285,6 +291,9 @@ async function settle(
         console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet`);
         await fundPolymarketWallet(totalSettlement.toString());
 
+        const nativeBal = await getNativeUsdcBalance();
+        console.log(`[trade] Post-fund native USDC balance on poly wallet: ${nativeBal} (need ${totalSettlement})`);
+
         step++;
         console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e`);
         await swapNativeUsdcToUsdcE(totalSettlement);
@@ -329,19 +338,25 @@ async function _closePosition(positionId: string, wallet: string) {
     console.log(`[trade]   Margin:     ${usd(marginMicro)} (locked in Vault)`);
     console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (from LPPool)`);
 
+    const actualBalance = await getConditionalTokenBalance(tokenId);
+    const sellShares = Math.min(position.shares, actualBalance);
+    if (sellShares <= 0) throw new Error("No conditional tokens to sell");
+
     const midpoint = await fetchMidpoint(tokenId);
     const negRisk = await fetchNegRisk(tokenId);
     const sellPrice = Math.max(0.001, midpoint * (1 - MAX_SLIPPAGE_BPS / 10_000));
 
+    console.log(`[trade]   On-chain:   ${actualBalance} tokens (stored ${position.shares}), selling ${sellShares}`);
     console.log(`[trade]   Midpoint:   $${midpoint.toFixed(4)} | sell @ $${sellPrice.toFixed(4)}`);
 
     await ensureExchangeApproval();
+    await ensureConditionalTokenApproval();
 
     console.log("[trade] Placing SELL order on CLOB...");
     const clobResult = await placeMarketOrder({
         tokenId,
         price: sellPrice,
-        amount: position.shares,
+        amount: sellShares,
         side: 1,
         negRisk,
     });
