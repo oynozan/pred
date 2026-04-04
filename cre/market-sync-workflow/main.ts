@@ -16,6 +16,7 @@ const configSchema = z.object({
     schedule: z.string(),
     gammaApiUrl: z.string(),
     backendSyncUrl: z.string(),
+    backendCursorUrl: z.string(),
     marketLimit: z.number().int().positive(),
 });
 
@@ -34,13 +35,6 @@ type GammaMarket = {
     endDateIso: string;
 };
 
-type GammaEvent = {
-    id: string;
-    title: string;
-    slug: string;
-    markets: GammaMarket[];
-};
-
 type SyncMarket = {
     conditionId: string;
     question: string;
@@ -53,17 +47,41 @@ type SyncPayload = {
     syncedAt: number;
     marketCount: number;
     markets: SyncMarket[];
+    nextOffset: number;
+};
+
+type CursorResponse = {
+    offset: number;
 };
 
 type PostResult = {
     statusCode: number;
 };
 
-const fetchMarkets = (sendRequester: HTTPSendRequester, config: Config): string => {
+/* Fetch current pagination offset from backend */
+const fetchCursor = (sendRequester: HTTPSendRequester, config: Config): string => {
+    const resp = sendRequester
+        .sendRequest({ url: config.backendCursorUrl, method: "GET" as const })
+        .result();
+
+    if (!ok(resp)) {
+        throw new Error(`Backend cursor returned ${resp.statusCode}`);
+    }
+
+    return new TextDecoder().decode(resp.body);
+};
+
+/* Fetch one page of markets from Gamma API */
+const fetchMarkets = (
+    sendRequester: HTTPSendRequester,
+    config: Config,
+    offset: number,
+): string => {
     const url =
         `${config.gammaApiUrl}/markets` +
         `?active=true&closed=false` +
-        `&limit=${config.marketLimit}`;
+        `&limit=${config.marketLimit}` +
+        `&offset=${offset}`;
 
     const resp = sendRequester.sendRequest({ url, method: "GET" as const }).result();
 
@@ -98,13 +116,18 @@ const fetchMarkets = (sendRequester: HTTPSendRequester, config: Config): string 
         });
     }
 
+    const nextOffset =
+        rawMarkets.length < config.marketLimit ? 0 : offset + config.marketLimit;
+
     return JSON.stringify({
         syncedAt: Math.floor(Date.now() / 1000),
         marketCount: markets.length,
         markets,
+        nextOffset,
     });
 };
 
+/* POST sync payload to backend */
 const postToBackend = (
     nodeRuntime: NodeRuntime<Config>,
     payloadJson: string,
@@ -140,30 +163,48 @@ const postToBackend = (
 
 // Cron trigger
 const onCronTrigger = (runtime: Runtime<Config>): string => {
-    // Fetch secret before any capability calls
     const accessToken = runtime.getSecret({ id: "BACKEND_ACCESS_TOKEN" }).result().value;
 
     const httpClient = new HTTPClient();
 
-    // Fetch markets
+    // 1. Read cursor from backend
+    const cursorJson = httpClient
+        .sendRequest(
+            runtime,
+            (sr: HTTPSendRequester, cfg: Config) => fetchCursor(sr, cfg),
+            consensusIdenticalAggregation<string>(),
+        )(runtime.config)
+        .result();
+
+    const cursor = JSON.parse(cursorJson) as CursorResponse;
+    const offset = cursor.offset ?? 0;
+    runtime.log(`Starting sync at offset=${offset}, limit=${runtime.config.marketLimit}`);
+
+    // 2. Fetch one page from Gamma
     const payloadJson = httpClient
-        .sendRequest(runtime, fetchMarkets, consensusIdenticalAggregation<string>())(runtime.config)
+        .sendRequest(
+            runtime,
+            (sr: HTTPSendRequester, cfg: Config) => fetchMarkets(sr, cfg, offset),
+            consensusIdenticalAggregation<string>(),
+        )(runtime.config)
         .result();
 
     const payload = JSON.parse(payloadJson) as SyncPayload;
-    runtime.log(`Fetched ${payload.marketCount} active markets from Polymarket`);
+    runtime.log(
+        `Fetched ${payload.marketCount} markets (offset=${offset}, nextOffset=${payload.nextOffset})`,
+    );
 
-    // POST to backend
+    // 3. POST to backend (includes nextOffset for cursor persistence)
     const result = runtime
-        .runInNodeMode(
-            postToBackend,
-            consensusIdenticalAggregation<PostResult>(),
-        )(payloadJson, accessToken)
+        .runInNodeMode(postToBackend, consensusIdenticalAggregation<PostResult>())(
+            payloadJson,
+            accessToken,
+        )
         .result();
 
     runtime.log(`Backend sync responded with status ${result.statusCode}`);
 
-    return `Synced ${payload.marketCount} markets`;
+    return `Synced ${payload.marketCount} markets (offset=${offset} → ${payload.nextOffset})`;
 };
 
 // init workflow
