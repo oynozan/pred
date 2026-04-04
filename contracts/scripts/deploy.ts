@@ -1,6 +1,7 @@
 import { ethers } from "hardhat";
 import * as fs from "fs";
 import * as path from "path";
+import axios from "axios";
 
 // Polygon mainnet external addresses
 const MAINNET = {
@@ -127,7 +128,19 @@ async function main() {
     await (await feeDist.grantRole(VAULT_ROLE, await vault.getAddress())).wait();
     console.log("  VAULT_ROLE on FeeDistributor -> Vault");
 
-    if (POLYMARKET_WALLET_ADDRESS) {
+    const POLYMARKET_WALLET_PK = process.env.POLYMARKET_WALLET_PK;
+    if (POLYMARKET_WALLET_PK) {
+        const polyWallet = new ethers.Wallet(POLYMARKET_WALLET_PK);
+        console.log(`  Polymarket wallet: ${polyWallet.address}`);
+        console.log("  Fetching Bridge deposit address from Polymarket...");
+        const bridgeResp = await axios.post("https://bridge.polymarket.com/deposit", {
+            address: polyWallet.address,
+        });
+        const depositAddress: string | undefined = bridgeResp.data?.address?.evm;
+        if (!depositAddress) throw new Error("Bridge API did not return an EVM deposit address");
+        await (await vault.setPolymarketWallet(depositAddress)).wait();
+        console.log(`  Vault polymarketWallet set to Bridge deposit address: ${depositAddress}`);
+    } else if (POLYMARKET_WALLET_ADDRESS) {
         await (await vault.setPolymarketWallet(POLYMARKET_WALLET_ADDRESS)).wait();
         console.log(`  Polymarket wallet set to ${POLYMARKET_WALLET_ADDRESS}`);
     }
