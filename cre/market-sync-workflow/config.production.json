@@ -1,5 +1,5 @@
 {
-  "schedule": "0 */1 * * * *",
+  "schedule": "0 0 */2 * * *",
   "gammaApiUrl": "https://gamma-api.polymarket.com",
   "backendSyncUrl": "http://localhost:5000/protected/markets/sync",
   "backendCursorUrl": "http://localhost:5000/protected/markets/sync/cursor",
