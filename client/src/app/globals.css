@@ -34,7 +34,6 @@
 :root {
     --background: #0f0a0a;
     --foreground: #e8e4e0;
-    --card: #1a1413;
     --card-foreground: #e8e4e0;
     --popover: #1a1413;
     --popover-foreground: #e8e4e0;
@@ -51,13 +50,13 @@
     --input: rgba(255, 255, 255, 0.1);
     --ring: #82d173;
     --radius: 0.5rem;
-    --surface: #161010;
+    --surface: #141414;
+    --card: #181818;
 }
 
 .dark {
     --background: #0f0a0a;
     --foreground: #e8e4e0;
-    --card: #1a1413;
     --card-foreground: #e8e4e0;
     --popover: #1a1413;
     --popover-foreground: #e8e4e0;
@@ -73,7 +72,6 @@
     --border: rgba(255, 255, 255, 0.08);
     --input: rgba(255, 255, 255, 0.1);
     --ring: #82d173;
-    --surface: #161010;
 }
 
 @layer base {
