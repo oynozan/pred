@@ -1,4 +1,5 @@
 import { Router } from "express";
+import axios from "axios";
 import { getDepositConfig, buildDepositTx } from "../../../services/deposit";
 import { getBridgeQuote, getBridgeTransactionData } from "../../../services/bridge";
 import { getUserMargin } from "../../../services/vault";
@@ -89,6 +90,47 @@ router.post("/bridge-tx", async (req, res) => {
     } catch (err: any) {
         console.error("[deposit/bridge-tx] Error:", err);
         res.status(500).json({ error: err.message || "Failed to build bridge transaction" });
+    }
+});
+
+router.get("/bridge-status", async (req, res) => {
+    try {
+        const { txHash, fromChain, toChain, bridge } = req.query;
+
+        if (!txHash) {
+            res.status(400).json({ error: "txHash is required" });
+            return;
+        }
+
+        const { data } = await axios.get("https://li.quest/v1/status", {
+            params: {
+                txHash,
+                fromChain,
+                toChain: toChain || 137,
+                bridge,
+            },
+        });
+
+        res.json({
+            status: data.status,
+            substatus: data.substatus || null,
+            receiving: data.receiving
+                ? {
+                      amount: data.receiving.amount,
+                      token: data.receiving.token
+                          ? {
+                                address: data.receiving.token.address,
+                                decimals: data.receiving.token.decimals,
+                                symbol: data.receiving.token.symbol,
+                            }
+                          : null,
+                      txHash: data.receiving.txHash || null,
+                  }
+                : null,
+        });
+    } catch (err: any) {
+        console.error("[deposit/bridge-status] Error:", err.message);
+        res.status(500).json({ error: err.message || "Failed to check bridge status" });
     }
 });
 
