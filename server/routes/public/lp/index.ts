@@ -3,10 +3,13 @@ import { getAllPools, getPoolState, getUserPositions } from "../../../services/l
 
 const router = Router();
 
-router.get("/pools", async (_req, res) => {
+router.get("/pools", async (req, res) => {
     try {
-        const pools = await getAllPools();
-        res.json(pools);
+        const all = await getAllPools();
+        const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 20, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
+        const pools = all.slice(offset, offset + limit);
+        res.json({ pools, total: all.length, limit, offset });
     } catch (err) {
         console.error("[lp/pools] Error:", err);
         res.status(500).json({ error: "Failed to fetch LP pools" });

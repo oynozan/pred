@@ -1,5 +1,8 @@
-import { getLPPoolContract } from "../lib/contracts";
+import { ethers } from "ethers";
+import { getLPPoolAddress, lpPoolAbi, multicall } from "../lib/contracts";
 import Market from "../models/Markets";
+
+const lpIface = new ethers.Interface(lpPoolAbi as ethers.InterfaceAbi);
 
 export interface PoolState {
     conditionId: string;
@@ -46,18 +49,22 @@ let _rateParamsTs = 0;
 
 async function getRateParams(): Promise<RateParams> {
     if (_rateParams && Date.now() - _rateParamsTs < 300_000) return _rateParams;
-    const pool = getLPPoolContract();
-    const [baseRate, kinkRate, maxRate, kinkUtilization] = await Promise.all([
-        pool.baseRate(),
-        pool.kinkRate(),
-        pool.maxRate(),
-        pool.kinkUtilization(),
-    ]);
+    const target = getLPPoolAddress();
+    const fns = ["baseRate", "kinkRate", "maxRate", "kinkUtilization"] as const;
+    const calls = fns.map(fn => ({
+        target,
+        callData: lpIface.encodeFunctionData(fn),
+    }));
+    const raw = await multicall(calls);
+    const vals = raw.map((r, i) => {
+        if (!r.success) throw new Error(`Failed to read ${fns[i]}`);
+        return BigInt(lpIface.decodeFunctionResult(fns[i], r.returnData)[0]);
+    });
     _rateParams = {
-        baseRate: BigInt(baseRate),
-        kinkRate: BigInt(kinkRate),
-        maxRate: BigInt(maxRate),
-        kinkUtilization: BigInt(kinkUtilization),
+        baseRate: vals[0],
+        kinkRate: vals[1],
+        maxRate: vals[2],
+        kinkUtilization: vals[3],
     };
     _rateParamsTs = Date.now();
     return _rateParams;
@@ -134,10 +141,8 @@ function buildPoolState(
     };
 }
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
 async function fetchAllPoolsFromChain(): Promise<PoolState[]> {
-    const pool = getLPPoolContract();
+    const target = getLPPoolAddress();
     const markets = await Market.find({}, { __v: 0 }).sort({ syncedAt: -1 }).lean();
     if (markets.length === 0) return [];
 
@@ -150,19 +155,28 @@ async function fetchAllPoolsFromChain(): Promise<PoolState[]> {
         }));
     }
 
-    const results: PoolState[] = [];
+    const calls = markets.map(m => ({
+        target,
+        callData: lpIface.encodeFunctionData("getPoolState", [m.conditionId]),
+    }));
 
-    for (const market of markets) {
+    const raw = await multicall(calls);
+
+    return markets.map((market, i) => {
+        const r = raw[i];
+        if (!r.success) return defaultPoolState(market, rateParams);
         try {
-            const state = await pool.getPoolState(market.conditionId);
-            results.push(buildPoolState(market, state, rateParams));
+            const decoded = lpIface.decodeFunctionResult("getPoolState", r.returnData);
+            return buildPoolState(market, {
+                totalDeposited: decoded.totalDeposited,
+                totalBorrowed: decoded.totalBorrowed,
+                availableLiquidity: decoded.availableLiquidity,
+                totalShares: decoded.totalShares,
+            }, rateParams);
         } catch {
-            results.push(defaultPoolState(market, rateParams));
+            return defaultPoolState(market, rateParams);
         }
-        await sleep(150);
-    }
-
-    return results;
+    });
 }
 
 export async function getAllPools(): Promise<PoolState[]> {
@@ -195,14 +209,22 @@ export async function getPoolState(conditionId: string): Promise<PoolState | nul
     return pools.find(p => p.conditionId === conditionId) ?? null;
 }
 
+export function prewarmPoolsCache(): void {
+    getAllPools().catch(err => console.error("[lp] Pre-warm failed:", err));
+}
+
+const USER_POS_CACHE_TTL = 10_000;
+const _userPosCache = new Map<string, { data: UserLPSummary; ts: number }>();
+
 export async function getUserPositions(address: string): Promise<UserLPSummary> {
-    // Reuse the cached pool data instead of making new RPC calls
+    const cached = _userPosCache.get(address);
+    if (cached && Date.now() - cached.ts < USER_POS_CACHE_TTL) return cached.data;
+
     const pools = await getAllPools();
     if (pools.length === 0) {
         return { positions: [], totalCurrentValue: "0", weightedApyBps: "0" };
     }
 
-    const pool = getLPPoolContract();
     let rateParams: RateParams;
     try {
         rateParams = await getRateParams();
@@ -210,19 +232,28 @@ export async function getUserPositions(address: string): Promise<UserLPSummary> 
         return { positions: [], totalCurrentValue: "0", weightedApyBps: "0" };
     }
 
+    const target = getLPPoolAddress();
+    const calls = pools.map(ps => ({
+        target,
+        callData: lpIface.encodeFunctionData("getUserPosition", [ps.conditionId, address]),
+    }));
+
+    const raw = await multicall(calls);
+
     const positions: LPPosition[] = [];
     let totalValue = 0n;
     let weightedRateSum = 0n;
 
-    for (const poolState of pools) {
+    for (let i = 0; i < pools.length; i++) {
+        const r = raw[i];
+        if (!r.success) continue;
         try {
-            const pos = await pool.getUserPosition(poolState.conditionId, address);
+            const decoded = lpIface.decodeFunctionResult("getUserPosition", r.returnData);
+            const userShares = BigInt(decoded.userShares);
+            const usdcValue = BigInt(decoded.usdcValue);
+            if (userShares === 0n) continue;
 
-            const userShares: bigint = pos.userShares;
-            const usdcValue: bigint = pos.usdcValue;
-
-            if (userShares === 0n) { await sleep(100); continue; }
-
+            const poolState = pools[i];
             const totalSharesBig = BigInt(poolState.totalShares);
             const utilBps = BigInt(poolState.utilizationBps);
             const rateBps = computeInterestRate(utilBps, rateParams);
@@ -245,18 +276,20 @@ export async function getUserPositions(address: string): Promise<UserLPSummary> 
             totalValue += usdcValue;
             weightedRateSum += usdcValue * rateBps;
         } catch {
-            // skip
+            continue;
         }
-        await sleep(150);
     }
 
     const weightedApyBps =
         totalValue > 0n ? (weightedRateSum / totalValue).toString() : "0";
 
-    return {
+    const result: UserLPSummary = {
         positions,
         totalCurrentValue: totalValue.toString(),
         weightedApyBps,
     };
+
+    _userPosCache.set(address, { data: result, ts: Date.now() });
+    return result;
 }
 

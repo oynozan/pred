@@ -4,10 +4,17 @@ import { fetchMergedBook, fetchPriceHistory } from "../../../services/polymarket
 
 const router = Router();
 
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
     try {
-        const markets = await Market.find({}, { __v: 0 }).sort({ syncedAt: -1 }).lean();
-        res.json(markets);
+        const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 20, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
+
+        const [markets, total] = await Promise.all([
+            Market.find({}, { __v: 0 }).sort({ syncedAt: -1 }).skip(offset).limit(limit).lean(),
+            Market.countDocuments(),
+        ]);
+
+        res.json({ markets, total, limit, offset });
     } catch (err) {
         console.error("[markets] Error fetching markets:", err);
         res.status(500).json({ error: "Internal server error" });

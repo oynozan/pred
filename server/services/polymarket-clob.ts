@@ -257,6 +257,20 @@ export async function fetchMidpoint(tokenId: string): Promise<number> {
     return parseFloat(resp.data.mid);
 }
 
+export async function fetchBestPrice(tokenId: string, side: "BUY" | "SELL"): Promise<number> {
+    const resp = await proxyAxios.get(`${CLOB_API}/book`, {
+        params: { token_id: tokenId },
+    });
+    if (side === "BUY") {
+        const asks: { price: string; size: string }[] = resp.data.asks ?? [];
+        if (asks.length === 0) throw new Error("No asks in order book");
+        return parseFloat(asks[0].price);
+    }
+    const bids: { price: string; size: string }[] = resp.data.bids ?? [];
+    if (bids.length === 0) throw new Error("No bids in order book");
+    return parseFloat(bids[0].price);
+}
+
 /* ---------- Public API ---------- */
 
 export interface PlaceOrderResult {
@@ -366,11 +380,23 @@ export async function getConditionalTokenBalance(tokenId: string): Promise<numbe
 
 /* ---------- Swap native USDC → USDC.e on polymarket wallet ---------- */
 
-function getPolymarketSigner(): ethers.Wallet {
+let _polymarketSigner: ethers.NonceManager | null = null;
+let _polymarketSignerAddress: string | null = null;
+
+function getPolymarketSigner(): ethers.NonceManager {
+    if (_polymarketSigner) return _polymarketSigner;
     const rpc = process.env.POLYGON_RPC_URL;
     if (!rpc) throw new Error("POLYGON_RPC_URL not set");
     const provider = new ethers.JsonRpcProvider(rpc);
-    return getWallet().connect(provider);
+    const wallet = getWallet().connect(provider);
+    _polymarketSignerAddress = wallet.address;
+    _polymarketSigner = new ethers.NonceManager(wallet);
+    return _polymarketSigner;
+}
+
+function getPolymarketSignerAddress(): string {
+    if (!_polymarketSignerAddress) getPolymarketSigner();
+    return _polymarketSignerAddress!;
 }
 
 export async function getNativeUsdcBalance(): Promise<bigint> {
@@ -418,7 +444,7 @@ export async function swapNativeUsdcToUsdcE(amountMicro: bigint): Promise<void> 
         signer,
     );
 
-    const currentAllowance: bigint = await nativeUsdc.allowance(signer.address, SWAP_ROUTER);
+    const currentAllowance: bigint = await nativeUsdc.allowance(getPolymarketSignerAddress(), SWAP_ROUTER);
     if (currentAllowance < swapAmount) {
         console.log("[CLOB] Approving SwapRouter for native USDC...");
         const approveTx = await nativeUsdc.approve(SWAP_ROUTER, ethers.MaxUint256);
@@ -439,7 +465,7 @@ export async function swapNativeUsdcToUsdcE(amountMicro: bigint): Promise<void> 
         tokenIn: NATIVE_USDC,
         tokenOut: USDC_E,
         fee: 100,
-        recipient: signer.address,
+        recipient: getPolymarketSignerAddress(),
         deadline: Math.floor(Date.now() / 1000) + 300,
         amountIn: swapAmount,
         amountOutMinimum: (swapAmount * 99n) / 100n,
@@ -475,7 +501,7 @@ export async function ensureExchangeApproval(): Promise<void> {
     const THRESHOLD = ethers.parseUnits("1000000", 6);
 
     for (const exchange of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE]) {
-        const allowance: bigint = await usdce.allowance(signer.address, exchange);
+        const allowance: bigint = await usdce.allowance(getPolymarketSignerAddress(), exchange);
         if (allowance < THRESHOLD) {
             console.log(`[CLOB] Approving ${exchange} for USDC.e...`);
             const tx = await usdce.approve(exchange, ethers.MaxUint256);
@@ -509,7 +535,7 @@ export async function ensureConditionalTokenApproval(): Promise<void> {
     );
 
     for (const exchange of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE]) {
-        const approved: boolean = await ctf.isApprovedForAll(signer.address, exchange);
+        const approved: boolean = await ctf.isApprovedForAll(getPolymarketSignerAddress(), exchange);
         if (!approved) {
             console.log(`[CLOB] setApprovalForAll ${exchange} on CTF contract...`);
             const tx = await ctf.setApprovalForAll(exchange, true);

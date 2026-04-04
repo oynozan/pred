@@ -4,6 +4,7 @@ import Position from "../models/Positions";
 import {
     placeMarketOrder,
     fetchMidpoint,
+    fetchBestPrice,
     fetchNegRisk,
     getPolymarketWalletBalance,
     getConditionalTokenBalance,
@@ -24,7 +25,7 @@ import { getPoolStats } from "./pool";
 import { openPosition as nettingOpen } from "./netting";
 import { broadcastPositionUpdate } from "../socket/broadcast";
 
-const MAX_SLIPPAGE_BPS = 100;
+const MAX_SLIPPAGE_BPS = 200;
 const USDC_DECIMALS = 6;
 const USDC_SCALE = 10 ** USDC_DECIMALS;
 
@@ -45,6 +46,14 @@ function usd(micro: bigint | string): string {
 /* ---------- Per-user trade lock ---------- */
 
 const _locks = new Map<string, Promise<unknown>>();
+
+/* ---------- Pending settlement tracker ---------- */
+
+const _pendingSettlements = new Map<string, Promise<void>>();
+
+function settlementKey(wallet: string, conditionId: string): string {
+    return `${wallet}:${conditionId}`;
+}
 
 async function withUserLock<T>(wallet: string, fn: () => Promise<T>): Promise<T> {
     const prev = _locks.get(wallet) ?? Promise.resolve();
@@ -88,10 +97,13 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
     const tokenId = isYes ? market.tokens.Yes.tokenId : market.tokens.No.tokenId;
 
     /* --- 2. CLOB data --- */
-    const midpoint = await fetchMidpoint(tokenId);
+    const [midpoint, bestPrice] = await Promise.all([
+        fetchMidpoint(tokenId),
+        fetchBestPrice(tokenId, "BUY"),
+    ]);
     if (midpoint <= 0 || midpoint >= 1) throw new Error("Invalid midpoint price");
 
-    const price = midpoint;
+    const price = bestPrice;
     const shares = Math.floor((amount / price) * USDC_SCALE) / USDC_SCALE;
 
     /* --- 3. Compute margin & borrow amounts --- */
@@ -174,8 +186,11 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
         orderId = clobResult.orderID;
         console.log(`[trade] CLOB order placed: ${orderId}`);
 
-        settle(wallet, conditionId, marginMicro, borrowedMicro, totalSettlement, isYes, shares)
-            .catch((err) => console.error("[trade] Background settlement failed:", err));
+        const key = settlementKey(wallet, conditionId);
+        const settlePromise = settle(wallet, conditionId, marginMicro, borrowedMicro, totalSettlement, isYes, shares)
+            .catch((err) => console.error("[trade] Background settlement failed:", err))
+            .finally(() => _pendingSettlements.delete(key));
+        _pendingSettlements.set(key, settlePromise);
     } else {
         const steps = (borrowedMicro > 0n ? 4 : 3);
         let step = 0;
@@ -325,6 +340,15 @@ async function _closePosition(positionId: string, wallet: string) {
     const position = await Position.findOne({ _id: positionId, wallet, status: "open" });
     if (!position) throw new Error("Position not found or already closed");
 
+    /* --- Await any pending background settlement before proceeding --- */
+    const key = settlementKey(wallet, position.conditionId);
+    const pendingSettle = _pendingSettlements.get(key);
+    if (pendingSettle) {
+        console.log(`[trade] Pending background settlement detected, awaiting...`);
+        await pendingSettle;
+        console.log(`[trade] Background settlement finished, proceeding with close`);
+    }
+
     const market = await Market.findOne({ conditionId: position.conditionId }).lean();
     if (!market) throw new Error("Market not found");
 
@@ -338,12 +362,16 @@ async function _closePosition(positionId: string, wallet: string) {
     console.log(`[trade]   Margin:     ${usd(marginMicro)} (locked in Vault)`);
     console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (from LPPool)`);
 
-    const actualBalance = await getConditionalTokenBalance(tokenId);
+    /* --- Fetch CLOB data in parallel --- */
+    const [actualBalance, midpoint, negRisk] = await Promise.all([
+        getConditionalTokenBalance(tokenId),
+        fetchMidpoint(tokenId),
+        fetchNegRisk(tokenId),
+    ]);
+
     const sellShares = Math.min(position.shares, actualBalance);
     if (sellShares <= 0) throw new Error("No conditional tokens to sell");
 
-    const midpoint = await fetchMidpoint(tokenId);
-    const negRisk = await fetchNegRisk(tokenId);
     const sellPrice = Math.max(0.001, midpoint * (1 - MAX_SLIPPAGE_BPS / 10_000));
 
     console.log(`[trade]   On-chain:   ${actualBalance} tokens (stored ${position.shares}), selling ${sellShares}`);
@@ -362,36 +390,52 @@ async function _closePosition(positionId: string, wallet: string) {
     });
     console.log(`[trade] SELL order placed: ${clobResult.orderID}`);
 
-    try {
-        if (marginMicro > 0n) {
-            console.log(`[trade] Releasing margin: ${usd(marginMicro)} back to user vault`);
-            await releaseMargin(wallet, marginMicro.toString());
-            console.log(`[trade] Margin released`);
-        }
-    } catch (err) {
-        console.error("[trade] releaseMargin on close FAILED:", err);
-    }
-
-    try {
-        if (borrowedMicro > 0n) {
-            console.log(`[trade] Repaying LP: ${usd(borrowedMicro)} back to LPPool`);
-            await repayToPool(position.conditionId, borrowedMicro.toString());
-            console.log(`[trade] LP repaid`);
-        }
-    } catch (err) {
-        console.error("[trade] repayToPool on close FAILED:", err);
-    }
-
+    /* --- Mark closed immediately, settle on-chain in background --- */
     position.status = "closed";
     await position.save();
 
     console.log(`[trade] === POSITION CLOSED ===`);
     console.log(`[trade]   OrderId: ${clobResult.orderID}`);
-    console.log(`[trade]   Margin ${usd(marginMicro)} returned to Vault`);
-    if (borrowedMicro > 0n) console.log(`[trade]   LP ${usd(borrowedMicro)} repaid to LPPool`);
+
+    closeSettle(wallet, position.conditionId, marginMicro, borrowedMicro).catch((err) =>
+        console.error("[trade] Background close-settlement failed:", err),
+    );
 
     broadcastPositionUpdate(wallet).catch(() => {});
     return position;
+}
+
+async function closeSettle(
+    wallet: string,
+    conditionId: string,
+    marginMicro: bigint,
+    borrowedMicro: bigint,
+): Promise<void> {
+    console.log(`[trade] === CLOSE SETTLEMENT START ===`);
+
+    try {
+        if (marginMicro > 0n) {
+            console.log(`[trade]   Releasing margin: ${usd(marginMicro)} back to user vault`);
+            await releaseMargin(wallet, marginMicro.toString());
+            console.log(`[trade]   Margin released`);
+        }
+    } catch (err) {
+        console.error("[trade]   releaseMargin on close FAILED:", err);
+    }
+
+    try {
+        if (borrowedMicro > 0n) {
+            console.log(`[trade]   Repaying LP: ${usd(borrowedMicro)} back to LPPool`);
+            await repayToPool(conditionId, borrowedMicro.toString());
+            console.log(`[trade]   LP repaid`);
+        }
+    } catch (err) {
+        console.error("[trade]   repayToPool on close FAILED:", err);
+    }
+
+    console.log(`[trade] === CLOSE SETTLEMENT DONE ===`);
+    console.log(`[trade]   Margin ${usd(marginMicro)} returned to Vault`);
+    if (borrowedMicro > 0n) console.log(`[trade]   LP ${usd(borrowedMicro)} repaid to LPPool`);
 }
 
 /* ---------- Rollback (settlement-first path, CLOB failed) ---------- */

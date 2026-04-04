@@ -27,8 +27,8 @@ router.post("/", authRequired, async (req: Request, res: Response) => {
             return;
         }
 
-        if (isNaN(numLeverage) || numLeverage < 1 || numLeverage > 20) {
-            res.status(400).json({ error: "leverage must be between 1 and 20" });
+        if (isNaN(numLeverage) || numLeverage < 1 || numLeverage > 3) {
+            res.status(400).json({ error: "leverage must be between 1 and 3" });
             return;
         }
 
