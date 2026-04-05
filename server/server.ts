@@ -14,6 +14,7 @@ import { SocketListeners } from "./socket/listeners";
 import { userToken, verifyServerToken } from "./routes/middleware";
 import { initContracts } from "./lib/contracts";
 import { prewarmPoolsCache } from "./services/lp";
+import { reconcileAll } from "./services/recovery";
 
 const app: Application = express();
 const server = require("http").createServer(app);
@@ -56,6 +57,9 @@ async function start() {
         try {
             initContracts();
             prewarmPoolsCache();
+            reconcileAll().catch(err =>
+                console.warn("[recovery] Startup reconciliation failed:", err.message),
+            );
         } catch (err) {
             console.warn("[contracts] Initialization failed — contract routes will not work:", err);
         }

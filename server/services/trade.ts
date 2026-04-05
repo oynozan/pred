@@ -277,6 +277,17 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
 
 /* ---------- Background settlement (optimistic path) ---------- */
 
+const STEP_TIMEOUT_MS = 60_000;
+
+function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    return Promise.race([
+        promise,
+        new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`[trade] ${label} timed out after ${STEP_TIMEOUT_MS / 1000}s`)), STEP_TIMEOUT_MS),
+        ),
+    ]);
+}
+
 async function settle(
     wallet: string,
     conditionId: string,
@@ -293,30 +304,30 @@ async function settle(
 
     step++;
     console.log(`[trade] [${step}/${steps}] Lock margin: ${usd(marginMicro)} from user vault`);
-    await lockMargin(wallet, marginMicro.toString());
+    await withTimeout(lockMargin(wallet, marginMicro.toString()), "lockMargin");
 
     if (borrowedMicro > 0n) {
         step++;
         console.log(`[trade] [${step}/${steps}] Borrow LP: ${usd(borrowedMicro)} from LPPool`);
-        await borrowFromPool(conditionId, borrowedMicro.toString());
+        await withTimeout(borrowFromPool(conditionId, borrowedMicro.toString()), "borrowFromPool");
     }
 
     if (totalSettlement > 0n) {
         step++;
         console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet`);
-        await fundPolymarketWallet(totalSettlement.toString());
+        await withTimeout(fundPolymarketWallet(totalSettlement.toString()), "fundPolymarketWallet");
 
         const nativeBal = await getNativeUsdcBalance();
         console.log(`[trade] Post-fund native USDC balance on poly wallet: ${nativeBal} (need ${totalSettlement})`);
 
         step++;
         console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e`);
-        await swapNativeUsdcToUsdcE(totalSettlement);
-        await ensureExchangeApproval();
+        await withTimeout(swapNativeUsdcToUsdcE(totalSettlement), "swapNativeUsdcToUsdcE");
+        await withTimeout(ensureExchangeApproval(), "ensureExchangeApproval");
     }
 
     console.log(`[trade] Registering netting position...`);
-    await nettingOpen(wallet, conditionId, isYes, toMicro(shares).toString());
+    await withTimeout(nettingOpen(wallet, conditionId, isYes, toMicro(shares).toString()), "nettingOpen");
 
     await Position.updateOne(
         { wallet, conditionId, settled: false, status: "open" },
@@ -344,10 +355,17 @@ async function _closePosition(positionId: string, wallet: string) {
     const key = settlementKey(wallet, position.conditionId);
     const pendingSettle = _pendingSettlements.get(key);
     if (pendingSettle) {
-        console.log(`[trade] Pending background settlement detected, awaiting...`);
-        await pendingSettle;
-        console.log(`[trade] Background settlement finished, proceeding with close`);
+        console.log(`[trade] Pending background settlement detected, awaiting (30s timeout)...`);
+        const timeout = new Promise<void>(r => setTimeout(r, 30_000));
+        await Promise.race([pendingSettle, timeout]);
+        _pendingSettlements.delete(key);
+        console.log(`[trade] Settlement await done`);
     }
+
+    /* Re-read the position to get the latest settled status */
+    const freshPosition = await Position.findById(positionId).lean();
+    const wasSettled = freshPosition?.settled ?? false;
+    console.log(`[trade]   settled=${wasSettled} (margin ${wasSettled ? "WAS" : "was NOT"} locked on-chain)`);
 
     const market = await Market.findOne({ conditionId: position.conditionId }).lean();
     if (!market) throw new Error("Market not found");
@@ -359,8 +377,8 @@ async function _closePosition(positionId: string, wallet: string) {
 
     console.log(`[trade]   Market:     "${market.question}"`);
     console.log(`[trade]   Side:       ${position.outcome} | shares=${position.shares}`);
-    console.log(`[trade]   Margin:     ${usd(marginMicro)} (locked in Vault)`);
-    console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (from LPPool)`);
+    console.log(`[trade]   Margin:     ${usd(marginMicro)} (${wasSettled ? "locked in Vault" : "NOT locked — settlement failed"})`);
+    console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (${wasSettled ? "from LPPool" : "NOT borrowed — settlement failed"})`);
 
     /* --- Fetch CLOB data in parallel --- */
     const [actualBalance, midpoint, negRisk] = await Promise.all([
@@ -397,9 +415,13 @@ async function _closePosition(positionId: string, wallet: string) {
     console.log(`[trade] === POSITION CLOSED ===`);
     console.log(`[trade]   OrderId: ${clobResult.orderID}`);
 
-    closeSettle(wallet, position.conditionId, marginMicro, borrowedMicro).catch((err) =>
-        console.error("[trade] Background close-settlement failed:", err),
-    );
+    if (wasSettled) {
+        closeSettle(wallet, position.conditionId, marginMicro, borrowedMicro).catch((err) =>
+            console.error("[trade] Background close-settlement failed:", err),
+        );
+    } else {
+        console.log(`[trade] Skipping close-settlement (open settlement never completed)`);
+    }
 
     broadcastPositionUpdate(wallet).catch(() => {});
     return position;

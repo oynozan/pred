@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
 import { getVaultContract } from "../lib/contracts";
+import { broadcastMarginUpdate } from "../socket/broadcast";
 
 export interface MarginInfo {
     total: string;
@@ -37,6 +38,7 @@ export async function lockMargin(user: string, amount: string): Promise<ethers.T
     const receipt = await tx.wait();
     console.log(`[vault] lockMargin confirmed block=${receipt.blockNumber}`);
     _marginCache.delete(user);
+    broadcastMarginUpdate(user).catch(() => {});
     return receipt;
 }
 
@@ -48,6 +50,7 @@ export async function releaseMargin(user: string, amount: string): Promise<ether
     const receipt = await tx.wait();
     console.log(`[vault] releaseMargin confirmed block=${receipt.blockNumber}`);
     _marginCache.delete(user);
+    broadcastMarginUpdate(user).catch(() => {});
     return receipt;
 }
 

@@ -4,6 +4,7 @@ import { proxyAxios } from "../lib/proxy-axios";
 
 const CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 
 const COLLATERAL_DECIMALS = 6;
 
@@ -500,15 +501,15 @@ export async function ensureExchangeApproval(): Promise<void> {
 
     const THRESHOLD = ethers.parseUnits("1000000", 6);
 
-    for (const exchange of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE]) {
-        const allowance: bigint = await usdce.allowance(getPolymarketSignerAddress(), exchange);
+    for (const spender of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER]) {
+        const allowance: bigint = await usdce.allowance(getPolymarketSignerAddress(), spender);
         if (allowance < THRESHOLD) {
-            console.log(`[CLOB] Approving ${exchange} for USDC.e...`);
-            const tx = await usdce.approve(exchange, ethers.MaxUint256);
+            console.log(`[CLOB] Approving ${spender} for USDC.e...`);
+            const tx = await usdce.approve(spender, ethers.MaxUint256);
             await tx.wait();
-            console.log(`[CLOB] Approved ${exchange}`);
+            console.log(`[CLOB] Approved ${spender}`);
         } else {
-            console.log(`[CLOB] ${exchange} already approved (allowance=${allowance})`);
+            console.log(`[CLOB] ${spender} already approved (allowance=${allowance})`);
         }
     }
 
@@ -534,15 +535,15 @@ export async function ensureConditionalTokenApproval(): Promise<void> {
         signer,
     );
 
-    for (const exchange of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE]) {
-        const approved: boolean = await ctf.isApprovedForAll(getPolymarketSignerAddress(), exchange);
+    for (const spender of [CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER]) {
+        const approved: boolean = await ctf.isApprovedForAll(getPolymarketSignerAddress(), spender);
         if (!approved) {
-            console.log(`[CLOB] setApprovalForAll ${exchange} on CTF contract...`);
-            const tx = await ctf.setApprovalForAll(exchange, true);
+            console.log(`[CLOB] setApprovalForAll ${spender} on CTF contract...`);
+            const tx = await ctf.setApprovalForAll(spender, true);
             await tx.wait();
-            console.log(`[CLOB] CTF approval granted to ${exchange}`);
+            console.log(`[CLOB] CTF approval granted to ${spender}`);
         } else {
-            console.log(`[CLOB] ${exchange} already approved for CTF tokens`);
+            console.log(`[CLOB] ${spender} already approved for CTF tokens`);
         }
     }
 
