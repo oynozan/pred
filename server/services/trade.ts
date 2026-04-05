@@ -1,4 +1,3 @@
-import { ethers } from "ethers";
 import Market from "../models/Markets";
 import Position from "../models/Positions";
 import {
@@ -22,7 +21,6 @@ import {
     fundPolymarketWallet,
 } from "./vault";
 import { getPoolStats } from "./pool";
-import { openPosition as nettingOpen } from "./netting";
 import { broadcastPositionUpdate } from "../socket/broadcast";
 
 const MAX_SLIPPAGE_BPS = 200;
@@ -43,9 +41,21 @@ function usd(micro: bigint | string): string {
     return `$${n.toFixed(2)}`;
 }
 
-/* ---------- Per-user trade lock ---------- */
+/* ---------- Separate locks for open / close ---------- */
 
-const _locks = new Map<string, Promise<unknown>>();
+const _openLocks = new Map<string, Promise<unknown>>();
+const _closeLocks = new Map<string, Promise<unknown>>();
+
+async function withLock<T>(locks: Map<string, Promise<unknown>>, key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = locks.get(key) ?? Promise.resolve();
+    const current = prev.then(fn, fn);
+    locks.set(key, current);
+    try {
+        return await current;
+    } finally {
+        if (locks.get(key) === current) locks.delete(key);
+    }
+}
 
 /* ---------- Pending settlement tracker ---------- */
 
@@ -53,17 +63,6 @@ const _pendingSettlements = new Map<string, Promise<void>>();
 
 function settlementKey(wallet: string, conditionId: string): string {
     return `${wallet}:${conditionId}`;
-}
-
-async function withUserLock<T>(wallet: string, fn: () => Promise<T>): Promise<T> {
-    const prev = _locks.get(wallet) ?? Promise.resolve();
-    const current = prev.then(fn, fn);
-    _locks.set(wallet, current);
-    try {
-        return await current;
-    } finally {
-        if (_locks.get(wallet) === current) _locks.delete(wallet);
-    }
 }
 
 /* ---------- Public API ---------- */
@@ -82,7 +81,7 @@ export interface TradeResult {
 }
 
 export async function executeTrade(params: TradeParams): Promise<TradeResult> {
-    return withUserLock(params.wallet, () => _executeTrade(params));
+    return withLock(_openLocks, params.wallet, () => _executeTrade(params));
 }
 
 async function _executeTrade(params: TradeParams): Promise<TradeResult> {
@@ -94,32 +93,39 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
     if (!market) throw new Error("Market not found");
 
     const isYes = outcome === "Yes";
-    const tokenId = isYes ? market.tokens.Yes.tokenId : market.tokens.No.tokenId;
+    const yesTokenId = market.tokens.Yes.tokenId;
+    const noTokenId = market.tokens.No.tokenId;
+    const primaryTokenId = isYes ? yesTokenId : noTokenId;
 
     /* --- 2. CLOB data --- */
     const [midpoint, bestPrice] = await Promise.all([
-        fetchMidpoint(tokenId),
-        fetchBestPrice(tokenId, "BUY"),
+        fetchMidpoint(primaryTokenId),
+        fetchBestPrice(primaryTokenId, "BUY"),
     ]);
     if (midpoint <= 0 || midpoint >= 1) throw new Error("Invalid midpoint price");
+    if (midpoint < 0.10 || midpoint > 0.90) {
+        throw new Error("Trading disabled for markets with odds below 10% or above 90%");
+    }
 
     const price = bestPrice;
     const shares = Math.floor((amount / price) * USDC_SCALE) / USDC_SCALE;
 
-    /* --- 3. Compute margin & borrow amounts --- */
+    /* --- 3. Compute margin & borrow amounts (2x cost for YES+NO hedge) --- */
     const amountMicro = toMicro(amount);
+    const hedgeCost = amountMicro * 2n;
     const marginMicro = toMicro(amount / leverage);
-    const borrowedMicro = amountMicro - marginMicro;
-    const totalSettlement = marginMicro + borrowedMicro;
+    const borrowedMicro = hedgeCost - marginMicro;
+    const totalSettlement = hedgeCost;
 
     const liqPrice = isYes
         ? price * (1 - 1 / leverage)
         : Math.min(1, price * (1 + 1 / leverage));
 
-    console.log(`[trade] === TRADE PLAN ===`);
+    console.log(`[trade] === TRADE PLAN (HEDGED) ===`);
     console.log(`[trade]   Market:       "${market.question}"`);
     console.log(`[trade]   Side:         ${outcome} @ $${price.toFixed(4)}`);
-    console.log(`[trade]   Total cost:   ${usd(amountMicro)} (${amountMicro} micro)`);
+    console.log(`[trade]   User amount:  ${usd(amountMicro)}`);
+    console.log(`[trade]   Hedge cost:   ${usd(hedgeCost)} (YES + NO)`);
     console.log(`[trade]   User margin:  ${usd(marginMicro)} (from Vault)`);
     console.log(`[trade]   LP borrow:    ${usd(borrowedMicro)} (from LPPool)`);
     console.log(`[trade]   Leverage:     ${leverage}x`);
@@ -139,35 +145,30 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
         );
     }
 
-    /* --- 5. Validate LP pool liquidity (skip if 1x) --- */
-    let poolLiquidity = "N/A (1x)";
-    if (borrowedMicro > 0n) {
-        const poolStats = await getPoolStats(conditionId);
-        poolLiquidity = usd(poolStats.availableLiquidity);
-        console.log(`[trade]   LP pool:      available=${poolLiquidity}`);
-        if (BigInt(poolStats.availableLiquidity) < borrowedMicro) {
-            throw new Error(`Insufficient LP pool liquidity: need ${usd(borrowedMicro)}, available ${poolLiquidity}`);
-        }
-    } else {
-        console.log(`[trade]   LP pool:      not needed (1x leverage)`);
+    /* --- 5. Validate LP pool liquidity --- */
+    const poolStats = await getPoolStats(conditionId);
+    const poolLiquidity = usd(poolStats.availableLiquidity);
+    console.log(`[trade]   LP pool:      available=${poolLiquidity}`);
+    if (BigInt(poolStats.availableLiquidity) < borrowedMicro) {
+        throw new Error(`Insufficient LP pool liquidity: need ${usd(borrowedMicro)}, available ${poolLiquidity}`);
     }
 
-    /* --- 6. Decide path --- */
-    const negRisk = await fetchNegRisk(tokenId);
-    const orderPrice = applySlippage(price);
+    /* --- 6. Decide path & place orders --- */
+    const negRisk = await fetchNegRisk(primaryTokenId);
+    const primaryOrderPrice = applySlippage(price);
+    const oppositePrice = 1 - price;
+    const oppositeOrderPrice = applySlippage(oppositePrice);
     const polyBalance = await getPolymarketWalletBalance();
-    const isOptimistic = polyBalance >= amountMicro;
+    const isOptimistic = polyBalance >= hedgeCost;
 
     console.log(`[trade]   Poly wallet:  ${usd(polyBalance)} (USDC.e)`);
 
     if (isOptimistic) {
         console.log(`[trade] === PATH: OPTIMISTIC ===`);
-        console.log(`[trade]   Poly wallet (${usd(polyBalance)}) >= total cost (${usd(amountMicro)})`);
-        console.log(`[trade]   Order placed FIRST, settlement runs in background`);
+        console.log(`[trade]   Poly wallet (${usd(polyBalance)}) >= hedge cost (${usd(hedgeCost)})`);
     } else {
         console.log(`[trade] === PATH: SETTLEMENT-FIRST ===`);
-        console.log(`[trade]   Poly wallet (${usd(polyBalance)}) < total cost (${usd(amountMicro)})`);
-        console.log(`[trade]   Must fund wallet before placing order`);
+        console.log(`[trade]   Poly wallet (${usd(polyBalance)}) < hedge cost (${usd(hedgeCost)})`);
     }
 
     await ensureExchangeApproval();
@@ -175,70 +176,57 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
     let orderId: string;
 
     if (isOptimistic) {
-        console.log("[trade] Placing CLOB order (using existing Poly wallet balance)...");
-        const clobResult = await placeMarketOrder({
-            tokenId,
-            price: orderPrice,
-            amount,
-            side: 0,
-            negRisk,
-        });
-        orderId = clobResult.orderID;
-        console.log(`[trade] CLOB order placed: ${orderId}`);
+        console.log("[trade] Placing HEDGED CLOB orders (primary + opposite)...");
+        const [primaryResult, oppositeResult] = await Promise.all([
+            placeMarketOrder({ tokenId: primaryTokenId, price: primaryOrderPrice, amount, side: 0, negRisk }),
+            placeMarketOrder({ tokenId: isYes ? noTokenId : yesTokenId, price: oppositeOrderPrice, amount, side: 0, negRisk }),
+        ]);
+        orderId = primaryResult.orderID;
+        console.log(`[trade] Primary order: ${orderId}`);
+        console.log(`[trade] Hedge order:   ${oppositeResult.orderID}`);
 
         const key = settlementKey(wallet, conditionId);
-        const settlePromise = settle(wallet, conditionId, marginMicro, borrowedMicro, totalSettlement, isYes, shares)
+        const settlePromise = settle(wallet, conditionId, marginMicro, borrowedMicro, totalSettlement)
             .catch((err) => console.error("[trade] Background settlement failed:", err))
             .finally(() => _pendingSettlements.delete(key));
         _pendingSettlements.set(key, settlePromise);
     } else {
-        const steps = (borrowedMicro > 0n ? 4 : 3);
+        const steps = 4;
         let step = 0;
 
         step++;
         console.log(`[trade] [${step}/${steps}] Lock margin: ${usd(marginMicro)} from user vault`);
         await lockMargin(wallet, marginMicro.toString());
 
-        if (borrowedMicro > 0n) {
-            step++;
-            console.log(`[trade] [${step}/${steps}] Borrow LP: ${usd(borrowedMicro)} from LPPool (conditionId=${conditionId.slice(0, 10)}...)`);
-            await borrowFromPool(conditionId, borrowedMicro.toString());
-        }
+        step++;
+        console.log(`[trade] [${step}/${steps}] Borrow LP: ${usd(borrowedMicro)} from LPPool`);
+        await borrowFromPool(conditionId, borrowedMicro.toString());
 
-        if (totalSettlement > 0n) {
-            step++;
-            console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet (native USDC)`);
-            await fundPolymarketWallet(totalSettlement.toString());
+        step++;
+        console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet`);
+        await fundPolymarketWallet(totalSettlement.toString());
+        const nativeBal = await getNativeUsdcBalance();
+        console.log(`[trade] Post-fund native USDC balance: ${nativeBal}`);
 
-            const nativeBal = await getNativeUsdcBalance();
-            console.log(`[trade] Post-fund native USDC balance on poly wallet: ${nativeBal} (need ${totalSettlement})`);
-
-            step++;
-            console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e via Uniswap`);
-            await swapNativeUsdcToUsdcE(totalSettlement);
-            await ensureExchangeApproval();
-        }
+        step++;
+        console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e`);
+        await swapNativeUsdcToUsdcE(totalSettlement);
+        await ensureExchangeApproval();
 
         try {
-            console.log("[trade] Placing CLOB order...");
-            const clobResult = await placeMarketOrder({
-                tokenId,
-                price: orderPrice,
-                amount,
-                side: 0,
-                negRisk,
-            });
-            orderId = clobResult.orderID;
-            console.log(`[trade] CLOB order placed: ${orderId}`);
+            console.log("[trade] Placing HEDGED CLOB orders (primary + opposite)...");
+            const [primaryResult, oppositeResult] = await Promise.all([
+                placeMarketOrder({ tokenId: primaryTokenId, price: primaryOrderPrice, amount, side: 0, negRisk }),
+                placeMarketOrder({ tokenId: isYes ? noTokenId : yesTokenId, price: oppositeOrderPrice, amount, side: 0, negRisk }),
+            ]);
+            orderId = primaryResult.orderID;
+            console.log(`[trade] Primary order: ${orderId}`);
+            console.log(`[trade] Hedge order:   ${oppositeResult.orderID}`);
         } catch (err) {
             console.error("[trade] CLOB order FAILED, rolling back...", err);
             await rollback(wallet, conditionId, marginMicro, borrowedMicro);
             throw err;
         }
-
-        nettingOpen(wallet, conditionId, isYes, toMicro(shares).toString()).catch((err) =>
-            console.error("[trade] Netting openPosition failed:", err),
-        );
     }
 
     /* --- 7. Save position --- */
@@ -266,9 +254,9 @@ async function _executeTrade(params: TradeParams): Promise<TradeResult> {
     console.log(`[trade]   Shares:    ${shares}`);
     console.log(`[trade]   Margin:    ${usd(marginMicro)} (from Vault)`);
     console.log(`[trade]   Borrowed:  ${usd(borrowedMicro)} (from LPPool)`);
-    console.log(`[trade]   Total:     ${usd(amountMicro)}`);
+    console.log(`[trade]   Hedge:     ${usd(hedgeCost)} (YES+NO)`);
     console.log(`[trade]   Liq price: $${liqPrice.toFixed(4)}`);
-    console.log(`[trade]   Path:      ${isOptimistic ? "optimistic (settlement in background)" : "settlement-first"}`);
+    console.log(`[trade]   Path:      ${isOptimistic ? "optimistic" : "settlement-first"}`);
     console.log(`[trade]   OrderId:   ${orderId}`);
 
     broadcastPositionUpdate(wallet).catch(() => {});
@@ -294,40 +282,30 @@ async function settle(
     marginMicro: bigint,
     borrowedMicro: bigint,
     totalSettlement: bigint,
-    isYes: boolean,
-    shares: number,
 ): Promise<void> {
-    const steps = (borrowedMicro > 0n ? 4 : 3);
-    let step = 0;
-
     console.log(`[trade] === BACKGROUND SETTLEMENT START (wallet=${wallet.slice(0, 10)}...) ===`);
 
+    let step = 0;
+
     step++;
-    console.log(`[trade] [${step}/${steps}] Lock margin: ${usd(marginMicro)} from user vault`);
+    console.log(`[trade] [${step}/4] Lock margin: ${usd(marginMicro)} from user vault`);
     await withTimeout(lockMargin(wallet, marginMicro.toString()), "lockMargin");
 
-    if (borrowedMicro > 0n) {
-        step++;
-        console.log(`[trade] [${step}/${steps}] Borrow LP: ${usd(borrowedMicro)} from LPPool`);
-        await withTimeout(borrowFromPool(conditionId, borrowedMicro.toString()), "borrowFromPool");
-    }
+    step++;
+    console.log(`[trade] [${step}/4] Borrow LP: ${usd(borrowedMicro)} from LPPool`);
+    await withTimeout(borrowFromPool(conditionId, borrowedMicro.toString()), "borrowFromPool");
 
-    if (totalSettlement > 0n) {
-        step++;
-        console.log(`[trade] [${step}/${steps}] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet`);
-        await withTimeout(fundPolymarketWallet(totalSettlement.toString()), "fundPolymarketWallet");
+    step++;
+    console.log(`[trade] [${step}/4] Fund poly: ${usd(totalSettlement)} Vault -> Polymarket wallet`);
+    await withTimeout(fundPolymarketWallet(totalSettlement.toString()), "fundPolymarketWallet");
 
-        const nativeBal = await getNativeUsdcBalance();
-        console.log(`[trade] Post-fund native USDC balance on poly wallet: ${nativeBal} (need ${totalSettlement})`);
+    const nativeBal = await getNativeUsdcBalance();
+    console.log(`[trade] Post-fund native USDC balance: ${nativeBal}`);
 
-        step++;
-        console.log(`[trade] [${step}/${steps}] Swap: ${usd(totalSettlement)} native USDC -> USDC.e`);
-        await withTimeout(swapNativeUsdcToUsdcE(totalSettlement), "swapNativeUsdcToUsdcE");
-        await withTimeout(ensureExchangeApproval(), "ensureExchangeApproval");
-    }
-
-    console.log(`[trade] Registering netting position...`);
-    await withTimeout(nettingOpen(wallet, conditionId, isYes, toMicro(shares).toString()), "nettingOpen");
+    step++;
+    console.log(`[trade] [${step}/4] Swap: ${usd(totalSettlement)} native USDC -> USDC.e`);
+    await withTimeout(swapNativeUsdcToUsdcE(totalSettlement), "swapNativeUsdcToUsdcE");
+    await withTimeout(ensureExchangeApproval(), "ensureExchangeApproval");
 
     await Position.updateOne(
         { wallet, conditionId, settled: false, status: "open" },
@@ -340,7 +318,7 @@ async function settle(
 /* ---------- Close position ---------- */
 
 export async function closePosition(positionId: string, wallet: string) {
-    return withUserLock(wallet, () => _closePosition(positionId, wallet));
+    return withLock(_closeLocks, wallet, () => _closePosition(positionId, wallet));
 }
 
 async function _closePosition(positionId: string, wallet: string) {
@@ -362,7 +340,6 @@ async function _closePosition(positionId: string, wallet: string) {
         console.log(`[trade] Settlement await done`);
     }
 
-    /* Re-read the position to get the latest settled status */
     const freshPosition = await Position.findById(positionId).lean();
     const wasSettled = freshPosition?.settled ?? false;
     console.log(`[trade]   settled=${wasSettled} (margin ${wasSettled ? "WAS" : "was NOT"} locked on-chain)`);
@@ -371,49 +348,55 @@ async function _closePosition(positionId: string, wallet: string) {
     if (!market) throw new Error("Market not found");
 
     const isYes = position.outcome === "Yes";
-    const tokenId = isYes ? market.tokens.Yes.tokenId : market.tokens.No.tokenId;
+    const yesTokenId = market.tokens.Yes.tokenId;
+    const noTokenId = market.tokens.No.tokenId;
     const marginMicro = toMicro(position.marginAmount);
     const borrowedMicro = toMicro(position.borrowedAmount);
 
     console.log(`[trade]   Market:     "${market.question}"`);
     console.log(`[trade]   Side:       ${position.outcome} | shares=${position.shares}`);
-    console.log(`[trade]   Margin:     ${usd(marginMicro)} (${wasSettled ? "locked in Vault" : "NOT locked — settlement failed"})`);
-    console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (${wasSettled ? "from LPPool" : "NOT borrowed — settlement failed"})`);
+    console.log(`[trade]   Margin:     ${usd(marginMicro)} (${wasSettled ? "locked in Vault" : "NOT locked"})`);
+    console.log(`[trade]   Borrowed:   ${usd(borrowedMicro)} (${wasSettled ? "from LPPool" : "NOT borrowed"})`);
 
-    /* --- Fetch CLOB data in parallel --- */
-    const [actualBalance, midpoint, negRisk] = await Promise.all([
-        getConditionalTokenBalance(tokenId),
-        fetchMidpoint(tokenId),
-        fetchNegRisk(tokenId),
+    /* --- Fetch balances & CLOB data for BOTH sides --- */
+    const [yesBal, noBal, negRisk] = await Promise.all([
+        getConditionalTokenBalance(yesTokenId),
+        getConditionalTokenBalance(noTokenId),
+        fetchNegRisk(yesTokenId),
     ]);
 
-    const sellShares = Math.min(position.shares, actualBalance);
-    if (sellShares <= 0) throw new Error("No conditional tokens to sell");
-
-    const sellPrice = Math.max(0.001, midpoint * (1 - MAX_SLIPPAGE_BPS / 10_000));
-
-    console.log(`[trade]   On-chain:   ${actualBalance} tokens (stored ${position.shares}), selling ${sellShares}`);
-    console.log(`[trade]   Midpoint:   $${midpoint.toFixed(4)} | sell @ $${sellPrice.toFixed(4)}`);
+    console.log(`[trade]   YES tokens: ${yesBal} | NO tokens: ${noBal}`);
 
     await ensureExchangeApproval();
     await ensureConditionalTokenApproval();
 
-    console.log("[trade] Placing SELL order on CLOB...");
-    const clobResult = await placeMarketOrder({
-        tokenId,
-        price: sellPrice,
-        amount: sellShares,
-        side: 1,
-        negRisk,
-    });
-    console.log(`[trade] SELL order placed: ${clobResult.orderID}`);
+    const sellPromises: Promise<{ orderID: string }>[] = [];
+
+    if (yesBal > 0) {
+        const yesMid = await fetchMidpoint(yesTokenId);
+        const yesSellPrice = Math.max(0.001, yesMid * (1 - MAX_SLIPPAGE_BPS / 10_000));
+        console.log(`[trade] Selling YES: ${yesBal} tokens @ $${yesSellPrice.toFixed(4)}`);
+        sellPromises.push(placeMarketOrder({ tokenId: yesTokenId, price: yesSellPrice, amount: yesBal, side: 1, negRisk }));
+    }
+
+    if (noBal > 0) {
+        const noMid = await fetchMidpoint(noTokenId);
+        const noSellPrice = Math.max(0.001, noMid * (1 - MAX_SLIPPAGE_BPS / 10_000));
+        console.log(`[trade] Selling NO:  ${noBal} tokens @ $${noSellPrice.toFixed(4)}`);
+        sellPromises.push(placeMarketOrder({ tokenId: noTokenId, price: noSellPrice, amount: noBal, side: 1, negRisk }));
+    }
+
+    if (sellPromises.length === 0) throw new Error("No conditional tokens to sell");
+
+    const sellResults = await Promise.all(sellPromises);
+    sellResults.forEach((r, i) => console.log(`[trade] SELL order #${i + 1}: ${r.orderID}`));
 
     /* --- Mark closed immediately, settle on-chain in background --- */
     position.status = "closed";
     await position.save();
 
     console.log(`[trade] === POSITION CLOSED ===`);
-    console.log(`[trade]   OrderId: ${clobResult.orderID}`);
+    console.log(`[trade]   OrderIds: ${sellResults.map(r => r.orderID).join(", ")}`);
 
     if (wasSettled) {
         closeSettle(wallet, position.conditionId, marginMicro, borrowedMicro).catch((err) =>
@@ -453,6 +436,10 @@ async function closeSettle(
         }
     } catch (err) {
         console.error("[trade]   repayToPool on close FAILED:", err);
+        await Position.updateOne(
+            { wallet, conditionId, status: "closed" },
+            { $set: { settled: false } },
+        ).catch(() => {});
     }
 
     console.log(`[trade] === CLOSE SETTLEMENT DONE ===`);
