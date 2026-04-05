@@ -1,0 +1,7 @@
+{
+  "chainSelectorName": "polygon-mainnet",
+  "vaultAddress": "0xE6d7e6b63E7b9Ce19613F1ABBd637D6b20e7F749",
+  "recoveryReceiverAddress": "0xC20Ec5eFcb73047E016EAADaA78C6dea3B7AE22E",
+  "backendPositionsUrl": "http://localhost:5000/protected/recovery/positions",
+  "gasLimit": "300000"
+}
