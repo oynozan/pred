@@ -128,7 +128,7 @@ router.get("/diagnose/:wallet", async (req, res) => {
             const usdc = new ethers.Contract(
                 usdcAddr,
                 ["function balanceOf(address) view returns (uint256)"],
-                vault.runner,
+                vault.runner as any,
             );
             contractUsdcBalance = (await usdc.balanceOf(await vault.getAddress())).toString();
         } catch {}

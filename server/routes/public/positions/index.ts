@@ -24,7 +24,7 @@ router.get("/", authRequired, async (req, res) => {
 
 router.post("/:id/close", authRequired, async (req, res) => {
     try {
-        const position = await closePosition(req.params.id, req.user!.wallet);
+        const position = await closePosition(req.params.id as string, req.user!.wallet);
         res.json(position);
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Failed to close position";
